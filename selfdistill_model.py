@@ -110,7 +110,7 @@ class SelfDistill_Cutmix_Model_Wrapper(nn.Module):
 
         distill_loss = nn.KLDivLoss(reduction="batchmean")(
             F.log_softmax(student_logits / temp, dim=1),
-            F.softmax(teacher_logits / temp, dim=1)
+            F.softmax(teacher_logits.detach() / temp, dim=1)
         ) * (temp ** 2)
 
         total_loss = 0.5 * (student_loss + teacher_loss) + distill_loss

@@ -33,6 +33,33 @@ class ModelTrainer():
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
           
+       
+    def fine_tune_all(self, dataloader, epochs=1, lr=1e-4):
+        self.turn_on_all_params() #all params are turned on for backprop
+        self.modelWrapper.train()
+
+        training_pts = len(dataloader.dataset)
+        for epoch in range(epochs):
+            predicts = 0
+            start = time.time()
+
+            for x, y in dataloader:
+                x = x.to(device)
+                y = y.to(device)
+                
+                #print(x.shape, y.shape)
+                loss, out, student_loss, teacher_loss, distill_loss = self.modelWrapper.get_loss_logit(x, y, self.criterion) 
+                                    
+                self.set_opt_lr(lr) #also reset opt grad to 0
+                loss.backward()                
+                self.optimizer.step()                
+                
+                predicts += (out.max(1)[1] == y).sum().item()
+
+
+            accu = 100.0*predicts/training_pts
+            print(f"LR: {lr:.6f} | Time: {time.time() - start:.1f} | Loss: {loss.item():.4f} | Accu: {accu:.4f}")
+
     def train_layer(self, layer_idx, dataloader, lr, epochs=1):        
         self.modelWrapper.set_trainable_layers_params(layer_idx) #only current layer params is for backprop
         self.modelWrapper.train()
@@ -66,32 +93,6 @@ class ModelTrainer():
         
         torch.save(self.modelWrapper.state_dict(), f"progressive_imagenet_{hidden_dim}_{num_layers}_weights.pth")
         
-    def fine_tune_all(self, dataloader, epochs=1, lr=1e-4):
-        self.turn_on_all_params() #all params are turned on for backprop
-        self.modelWrapper.train()
-
-        training_pts = len(dataloader.dataset)
-        for epoch in range(epochs):
-            predicts = 0
-            start = time.time()
-
-            for x, y in dataloader:
-                x = x.to(device)
-                y = y.to(device)
-                
-                #print(x.shape, y.shape)
-                loss, out = self.modelWrapper.get_loss_logit(x, y, self.criterion) 
-                                    
-                self.set_opt_lr(lr) #also reset opt grad to 0
-                loss.backward()                
-                self.optimizer.step()                
-                
-                predicts += (out.max(1)[1] == y).sum().item()
-
-
-            accu = 100.0*predicts/training_pts
-            print(f"LR: {lr:.6f} | Time: {time.time() - start:.1f} | Loss: {loss.item():.4f} | Accu: {accu:.4f}")
-
     def turn_on_all_params(self):
         # Final training stage: unfreeze everything and train end-to-end
         for param in self.modelWrapper.parameters():
@@ -121,4 +122,129 @@ class ModelTrainer():
         flips = [image, torch.flip(image, dims=[-1])]
         outputs = [teacher(f) for f in flips]
         return torch.stack(outputs).mean(dim=0)
-        
+
+class EMAModelTrainer():
+    def __init__(self, modelWrapper, optimizer, num_classes, num_layers, epochs=1, lr_min=0.0001, lr_max=0.001):
+
+        self.modelWrapper = modelWrapper
+        self.num_classes = num_classes
+        self.num_layers = num_layers
+
+        self.epochs = epochs
+        self.lr_min = lr_min
+        self.lr_max = lr_max
+
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+        self.optimizer = optimizer
+
+    def set_opt_lr(self, lr):
+        self.optimizer.zero_grad()
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+
+
+    def fine_tune_all(
+        self,
+        dataloader,
+        max_epochs=500,
+        lr=1e-4,
+        min_epochs=100,
+        ema_beta=0.95,
+        window=5,
+        eps_kl=0.01,
+        eps_gap=0.01,
+        eps_improve=0.0005,
+        patience=3
+    ):
+
+        self.turn_on_all_params()
+        self.modelWrapper.train()
+
+        training_pts = len(dataloader.dataset)
+
+        # ---- EMA trackers ----
+        ema_teacher = None
+        ema_student = None
+        ema_kl = None
+
+        history = []
+        stop_counter = 0
+
+        for epoch in range(max_epochs):
+
+            predicts = 0
+            start = time.time()
+
+            epoch_teacher = 0.0
+            epoch_student = 0.0
+            epoch_kl = 0.0
+            batches = 0
+
+            for x, y in dataloader:
+
+                x = x.to(device)
+                y = y.to(device)
+
+                loss, out, student_loss, teacher_loss, distill_loss = self.modelWrapper.get_loss_logit(x, y, self.criterion)
+
+                self.set_opt_lr(lr)
+                loss.backward()
+                self.optimizer.step()
+
+                predicts += (out.max(1)[1] == y).sum().item()
+
+                epoch_teacher += teacher_loss.item()
+                epoch_student += student_loss.item()
+                epoch_kl += distill_loss.item()
+                batches += 1
+
+            # ---- epoch averages ----
+            epoch_teacher /= batches
+            epoch_student /= batches
+            epoch_kl /= batches
+
+            # ---- EMA update ----
+            if ema_teacher is None:
+                ema_teacher = epoch_teacher
+                ema_student = epoch_student
+                ema_kl = epoch_kl
+            else:
+                ema_teacher = ema_beta * ema_teacher + (1 - ema_beta) * epoch_teacher
+                ema_student = ema_beta * ema_student + (1 - ema_beta) * epoch_student
+                ema_kl = ema_beta * ema_kl + (1 - ema_beta) * epoch_kl
+
+            history.append((ema_teacher, ema_student, ema_kl))
+
+            accu = 100.0 * predicts / training_pts
+
+            print(
+                f"Epoch {epoch:03d} | LR {lr:.6f} | "
+                f"T {ema_teacher:.4f} | "
+                f"S {ema_student:.4f} | "
+                f"KL {ema_kl:.4f} | "
+                f"Acc {accu:.2f} | "
+                f"Time {time.time() - start:.1f}"
+            )
+
+            # ---- Convergence check ----
+            if epoch >= min_epochs and len(history) > window:
+
+                old_teacher, old_student, old_kl = history[-window]
+
+                # A) KL stabilization
+                kl_stable = abs(ema_kl - old_kl) / (old_kl + 1e-8) < eps_kl
+
+                # B) teacher-student loss gap small
+                gap_small = abs(ema_teacher - ema_student) < eps_gap
+
+                # C) teacher improvement plateau
+                teacher_plateau = (old_teacher - ema_teacher) < eps_improve
+
+                if kl_stable and gap_small and teacher_plateau:
+                    stop_counter += 1
+                else:
+                    stop_counter = 0
+
+                if stop_counter >= patience:
+                    print(">>> Training stopped (convergence reached).")
+                    break        
