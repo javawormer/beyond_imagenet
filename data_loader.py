@@ -21,109 +21,22 @@ def get_up_down_lr(epochs, current_epoch, lr_min, lr_max):
         lr = lr_max - (lr_max - lr_min) * ((current_epoch - half_cycle) / (epochs - half_cycle))
     return lr
 
+
 def get_up_cos_lr(epochs, current_epoch, lr_min, lr_max, warmup_epochs):
     if current_epoch < warmup_epochs:
-        return lr_max * (current_epoch + 1) / warmup_epochs  # Linear warm-up from 0 → 1
-    else:
-        # Cosine annealing from base_lr → min_lr
-        cosine_epochs = epochs - warmup_epochs
-        progress = (current_epoch+1 - warmup_epochs) / cosine_epochs
-        cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
-        return lr_min + (lr_max - lr_min) * cosine_decay
+        return lr_max * (current_epoch + 1) / warmup_epochs
 
-def load_model_wts(model, dataset, patch_size, hidden_dim, num_layers):
-    weights_path = f"progressive_{dataset}_{patch_size}_{hidden_dim}_{num_layers}_weights.pth"
+    cosine_epochs = epochs - warmup_epochs
+    progress = (current_epoch - warmup_epochs) / max(1, cosine_epochs - 1)
+    cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+
+    return lr_min + (lr_max - lr_min) * cosine_decay
+
+def load_model_wts(model, dataset):
+    weights_path = f"progressive_{dataset}_weights.pth"
     if os.path.exists(weights_path):        
         model.load_state_dict(torch.load(weights_path))
         
-def count_params_and_shapes(model, input_size=(1, 3, 160, 160)):
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-
-    hooks = []
-    total_params = 0
-    total_trainable = 0
-    total_flops = 0
-    
-    seen_params = set()
-    layer_infos = []
-
-    module_to_name = {m: n for n, m in model.named_modules()}
-
-    def hook_fn(module, input, output):
-        # Skip container modules
-        if isinstance(module, (nn.Sequential, nn.ModuleList, nn.ModuleDict)) or len(list(module.children())) > 0:
-            return
-
-        name = module.__class__.__name__
-        full_path = module_to_name.get(module, '')
-        block = '.'.join(full_path.split('.')[:-1])  # e.g., stem.0 → stem
-
-        input_shape = tuple(input[0].shape) if isinstance(input, (tuple, list)) else tuple(input.shape)
-        output_shape = tuple(output.shape) if isinstance(output, torch.Tensor) else str(output)
-
-        # Collect kernel shapes and count params
-        kernel_shapes = []
-        num_params = 0
-        trainable_params = 0
-
-        for p in module.parameters(recurse=False):
-            if id(p) in seen_params:
-                continue
-            seen_params.add(id(p))
-
-            num_params += p.numel()
-            if p.requires_grad:
-                trainable_params += p.numel()
-
-            if p.ndim == 4:
-                reordered = (p.shape[1], p.shape[0], p.shape[2], p.shape[3])  # [in, out, h, w]
-                kernel_shapes.append(reordered)
-            elif p.ndim >= 2:
-                kernel_shapes.append(tuple(p.shape))
-
-        nonlocal total_params, total_trainable
-        total_params += num_params
-        total_trainable += trainable_params
-
-        layer_infos.append((block, name, input_shape, output_shape, trainable_params, kernel_shapes))
-
-    # Register hooks
-    for module in model.modules():
-        if not isinstance(module, (nn.Sequential, nn.ModuleList, nn.ModuleDict)):
-            hooks.append(module.register_forward_hook(hook_fn))
-
-    # Forward pass with dummy input to trigger hooks
-    model.eval()
-    dummy_input = torch.randn(*input_size).to(device)
-    with torch.no_grad():
-        model(dummy_input)
-        total_flops = FlopCountAnalysis(model, dummy_input)
-        total_flops.unsupported_ops_warnings(False)
-
-
-    # Remove hooks
-    for h in hooks:
-        h.remove()
-
-    # Print results
-    print("\nLayer-wise grouped shape and parameter analysis:")
-    prev_block = None
-    for idx, (block, name, in_shape, out_shape, params, kernels) in enumerate(layer_infos):
-        if block != prev_block:
-            print(f"\nBlock: {block or '[root]'}")
-            print("-" * 120)
-            prev_block = block
-
-        k_str = ', '.join([str(k) for k in kernels]) if kernels else '-'
-        print(f"{idx+1:>2}. {name:<20} ({params:,})".ljust(40) +
-              f"| In: {str(in_shape):<20} → Out: {str(out_shape):<20} | Kernels: {k_str:<40}")
-
-    print(f"\n✅ Total Trainable/Total Parameters: {total_trainable:,} / {total_params:,}")
-    m_flops = total_flops.total() / 1e6 
-    print(f"\n✅ Total FLOPS (M): {m_flops:.2f}M")
-
 def count_params(model):
     print("Trainable parameters by layer:")   
     total_trainable = 0
@@ -200,4 +113,174 @@ def cutmix(x, y, alpha=0.5):
     targets_a = y.clone()
     targets_b = y[index]
     return x_cutmix, targets_a, targets_b, lam
+
+def count_params_and_shapes(model, input_size=(1, 3, 160, 160)):
+    import torch
+    import torch.nn as nn
+    from fvcore.nn import FlopCountAnalysis
+
+    # ------------------------------------------------------------
+    # Wrapper for models that return tuples/lists
+    # ------------------------------------------------------------
+    class FLOPWrapper(nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+
+        def forward(self, x):
+            y = self.model(x)
+
+            if isinstance(y, (tuple, list)):
+                return y[0]
+
+            return y
+
+    hooks = []
+    total_params = 0
+    total_trainable = 0
+
+    seen_params = set()
+    layer_infos = []
+
+    module_to_name = {m: n for n, m in model.named_modules()}
+
+    # ------------------------------------------------------------
+    # Hook
+    # ------------------------------------------------------------
+    def hook_fn(module, input, output):
+
+        # Skip container modules
+        if isinstance(module, (nn.Sequential, nn.ModuleList, nn.ModuleDict)):
+            return
+
+        name = module.__class__.__name__
+        full_path = module_to_name.get(module, "")
+        block = ".".join(full_path.split(".")[:-1])
+
+        input_shape = tuple(input[0].shape) if isinstance(input, (tuple, list)) else tuple(input.shape)
+
+        if isinstance(output, torch.Tensor):
+            output_shape = tuple(output.shape)
+        elif isinstance(output, (tuple, list)):
+            output_shape = str([tuple(o.shape) for o in output if isinstance(o, torch.Tensor)])
+        else:
+            output_shape = str(output)
+
+        kernel_shapes = []
+        num_params = 0
+        trainable_params = 0
+
+        for p in module.parameters(recurse=False):
+
+            if id(p) in seen_params:
+                continue
+
+            seen_params.add(id(p))
+
+            num_params += p.numel()
+
+            if p.requires_grad:
+                trainable_params += p.numel()
+
+            if p.ndim == 4:
+                kernel_shapes.append(
+                    (p.shape[1], p.shape[0], p.shape[2], p.shape[3])
+                )
+            elif p.ndim >= 2:
+                kernel_shapes.append(tuple(p.shape))
+
+        nonlocal total_params, total_trainable
+        total_params += num_params
+        total_trainable += trainable_params
+
+        layer_infos.append(
+            (
+                block,
+                name,
+                input_shape,
+                output_shape,
+                trainable_params,
+                kernel_shapes,
+            )
+        )
+
+    # ------------------------------------------------------------
+    # Register hooks
+    # ------------------------------------------------------------
+    for module in model.modules():
+        if not isinstance(module, (nn.Sequential, nn.ModuleList, nn.ModuleDict)):
+            hooks.append(module.register_forward_hook(hook_fn))
+
+    # ------------------------------------------------------------
+    # Forward pass
+    # ------------------------------------------------------------
+    model.eval()
+
+    device = next(model.parameters()).device
+    dummy_input = torch.randn(*input_size).to(device)
+
+    with torch.no_grad():
+        model(dummy_input)
+
+    # ------------------------------------------------------------
+    # Remove hooks
+    # ------------------------------------------------------------
+    for h in hooks:
+        h.remove()
+
+    # ------------------------------------------------------------
+    # FLOPs
+    # ------------------------------------------------------------
+    try:
+        flop_model = FLOPWrapper(model).eval()
+
+        flops = FlopCountAnalysis(flop_model, dummy_input)
+        flops.unsupported_ops_warnings(False)
+        flops.uncalled_modules_warnings(False)
+
+        total_flops = flops.total()
+
+    except Exception as e:
+        print("\nFLOP computation failed:", e)
+        total_flops = 0
+
+    # ------------------------------------------------------------
+    # Print layer information
+    # ------------------------------------------------------------
+    print("\nLayer-wise grouped shape and parameter analysis:")
+
+    prev_block = None
+
+    for idx, (block, name, in_shape, out_shape, params, kernels) in enumerate(layer_infos):
+
+        if block != prev_block:
+            print(f"\nBlock: {block or '[root]'}")
+            print("-" * 130)
+            prev_block = block
+
+        k_str = ", ".join(str(k) for k in kernels) if kernels else "-"
+
+        print(
+            f"{idx+1:>3}. {name:<20} ({params:,})".ljust(40)
+            + f"| In: {str(in_shape):<22}"
+            + f" → Out: {str(out_shape):<22}"
+            + f"| Kernels: {k_str}"
+        )
+
+    # ------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------
+    print("\n" + "=" * 80)
+
+    print(f"Total Parameters           : {total_params:,}")
+    print(f"Trainable Parameters       : {total_trainable:,}")
+
+    if total_flops > 0:
+        gflops = total_flops / 1e9
+        gmacs = gflops / 2
+
+        print(f"Total MACs                : {gmacs:.3f} GMACs")
+        print(f"Total FLOPs               : {gflops:.3f} GFLOPs")
+
+    print("=" * 80)
    

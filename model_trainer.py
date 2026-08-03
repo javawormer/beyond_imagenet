@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
-
+from sklearn.metrics import f1_score
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -34,7 +34,7 @@ class ModelTrainer():
             param_group['lr'] = lr
           
        
-    def fine_tune_all(self, dataloader, epochs=1, lr=1e-4):
+    def fine_tune_all_old(self, dataloader, epochs=1, lr=1e-4):
         self.turn_on_all_params() #all params are turned on for backprop
         self.modelWrapper.train()
 
@@ -60,6 +60,67 @@ class ModelTrainer():
             accu = 100.0*predicts/training_pts
             print(f"LR: {lr:.6f} | Time: {time.time() - start:.1f} | Loss: {loss.item():.4f} | Accu: {accu:.4f}")
 
+    def fine_tune_all(self, dataloader, epochs=1, lr=1e-4):
+        self.turn_on_all_params()
+        self.modelWrapper.train()
+    
+        training_pts = len(dataloader.dataset)
+    
+        for epoch in range(epochs):
+    
+            predicts = 0
+            total_loss = 0
+    
+            all_preds = []
+            all_labels = []
+    
+            start = time.time()
+    
+            for x, y in dataloader:
+    
+                x = x.to(device)
+                y = y.to(device)
+    
+                loss, out, student_loss, teacher_loss, distill_loss = \
+                    self.modelWrapper.get_loss_logit(x, y, self.criterion)
+    
+                self.set_opt_lr(lr)
+    
+                loss.backward()
+                self.optimizer.step()
+    
+                # ----------------------------
+                # Accuracy
+                # ----------------------------
+                pred = out.argmax(dim=1)
+    
+                predicts += (pred == y).sum().item()
+    
+                # ----------------------------
+                # Store for F1
+                # ----------------------------
+                all_preds.extend(pred.detach().cpu().numpy())
+                all_labels.extend(y.detach().cpu().numpy())
+    
+    
+                total_loss += loss.item()
+    
+    
+            # ----------------------------
+            # Metrics
+            # ----------------------------
+            accu = 100.0 * predicts / training_pts    
+    
+            avg_loss = total_loss / len(dataloader)
+    
+    
+            print(
+                f"LR: {lr:.6f} | "
+                f"Time: {time.time()-start:.1f}s | "
+                f"Loss: {avg_loss:.4f} | "
+                f"Acc: {accu:.2f}% | "
+            )
+        
     def train_layer(self, layer_idx, dataloader, lr, epochs=1):        
         self.modelWrapper.set_trainable_layers_params(layer_idx) #only current layer params is for backprop
         self.modelWrapper.train()
@@ -99,7 +160,7 @@ class ModelTrainer():
             param.requires_grad = True
                 
 
-    def evaluate_model(self, test_loader, device):
+    def evaluate_model_old(self, test_loader, device):
         teacher = self.modelWrapper.teacher
         teacher.eval()  # evaluation mode
     
@@ -115,6 +176,53 @@ class ModelTrainer():
                 correct += (predicted == labels).sum().item()
     
         accuracy = 100.0 * correct / total_samples
+        return accuracy
+
+    def evaluate_model(self, test_loader, device):
+        from sklearn.metrics import f1_score
+    
+        teacher = self.modelWrapper.teacher
+        teacher.eval()
+    
+        correct = 0
+        total_samples = len(test_loader.dataset)
+    
+        all_preds = []
+        all_labels = []
+    
+        with torch.no_grad():
+            for inputs, labels in test_loader:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+    
+                outputs = teacher(inputs)
+                predicted = outputs.argmax(dim=1)
+    
+                correct += (predicted == labels).sum().item()
+    
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+    
+        accuracy = 100.0 * correct / total_samples
+    
+        macro_f1 = f1_score(
+            all_labels,
+            all_preds,
+            average="macro"
+        )
+    
+        weighted_f1 = f1_score(
+            all_labels,
+            all_preds,
+            average="weighted"
+        )
+
+        print(
+            f"Test Accuracy: {accuracy:.2f}% | "
+            f"Macro F1: {macro_f1:.4f} | "
+            f"Weighted F1: {weighted_f1:.4f}"
+        )
+
         return accuracy
 
     #The model predicts on both the original and flipped image for test dataset.
