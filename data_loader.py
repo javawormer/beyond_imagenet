@@ -283,4 +283,78 @@ def count_params_and_shapes(model, input_size=(1, 3, 160, 160)):
         print(f"Total FLOPs               : {gflops:.3f} GFLOPs")
 
     print("=" * 80)
-   
+    
+    gpuTime = measure_gpu_latency_cuda_events(model)
+    print("GPU Time/input=milliseconds (ms):", gpuTime)
+    
+
+
+def measure_gpu_latency_cuda_events(
+    model,
+    input_shape=(1, 3, 224, 224),
+    warmup_runs=100,
+    benchmark_runs=1000,
+    device="cuda",
+):
+    model = model.to(device)
+    model.eval()
+
+    x = torch.randn(*input_shape, device=device)
+
+    # Warmup
+    with torch.no_grad():
+        for _ in range(warmup_runs):
+            model(x)
+
+    torch.cuda.synchronize()
+
+    # Reset memory tracking
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
+    timings = []
+    memory_samples = []
+
+    starter = torch.cuda.Event(enable_timing=True)
+    ender = torch.cuda.Event(enable_timing=True)
+
+    with torch.no_grad():
+        for _ in range(benchmark_runs):
+
+            starter.record()
+
+            model(x)
+
+            ender.record()
+
+            torch.cuda.synchronize()
+
+            # Latency (ms)
+            timings.append(starter.elapsed_time(ender))
+
+            # Memory after inference (bytes)
+            memory_samples.append(
+                torch.cuda.memory_allocated(device)
+            )
+
+    # Compute statistics
+    avg_latency_ms = sum(timings) / len(timings)
+
+    avg_memory_MB = (
+        sum(memory_samples) / len(memory_samples)
+    ) / (1024 ** 2)
+
+    peak_memory_MB = (
+        torch.cuda.max_memory_allocated(device)
+    ) / (1024 ** 2)
+
+    reserved_memory_MB = (
+        torch.cuda.memory_reserved(device)
+    ) / (1024 ** 2)
+
+    return {
+        "avg_latency_ms": avg_latency_ms,
+        "avg_memory_MB": avg_memory_MB,
+        "peak_memory_MB": peak_memory_MB,
+        "reserved_memory_MB": reserved_memory_MB,
+    }
